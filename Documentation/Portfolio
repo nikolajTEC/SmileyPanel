@@ -1,0 +1,15 @@
+Start tanker:
+-   Vi laver hvert vores board, så begge får mulighed for at lege med det
+-   Vi uploader til github, så vi begge kan uploade og hente
+-   Vi laver et step af gangen, for at se om vi kan få hver del til at virke selv
+-   Vi sparer når den anden har problemer.
+-   Vi laver tingene i samme rækkefølge og går kun videre, når begge er færdig med steppet
+Rækkefølge: 
+-   Lav en knap først og send korrekt signal
+-   Lav alle fire knapper
+-   Lav en lampe
+-   Lav alle fire lamper
+-   Når det hele virker uploader vi til github
+-   Refactoring sammen
+-   Lav arbejdsfolio
+-   Lav Fritzing tegning
