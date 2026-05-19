@@ -5,6 +5,11 @@
 // Used by the ESP32 ext1 wakeup API, which expects a bitmask of wake-capable pins.
 #define BUTTON_PIN_BITMASK(GPIO) (1ULL << GPIO)
 
+// Conversion factor for microsecons to seconds
+#define uS_TO_S_FACTOR 1000000ULL  
+// Time ESP32 will go to sleep (in seconds)
+#define TIME_TO_SLEEP  30        
+
 // Struct pairing each physical button with:
 //   wakePin   – the RTC GPIO that wakes the ESP32 from deep sleep
 //   outputPin – the GPIO to pulse HIGH when this button triggers a wakeup
@@ -66,10 +71,33 @@ void handleWakeupButton() {
 
 void setup() {
   Serial.begin(115200);
-  // Handles push of button
-  handleWakeupButton();
+  delay(100); // Brief delay to ensure Serial is fully ready after waking up
+  
+  // Increment boot number for tracking
+  bootCount++;
+
+  // Read the wakeup reason to decide whether a button or the timer woke us up
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+
+  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT1) {
+    // Handles push of button
+    handleWakeupButton();
+  } 
+  else if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) {
+    // Write to console im alive if woke up by the 30s timer
+    Serial.println("im alive");
+  } 
+  else {
+    // Fallback for initial power-on or reset
+    Serial.printf("Initial boot count: %d\n", bootCount);
+  }
+
   // Makes it so the buttons can wake it from deep sleep
   esp_sleep_enable_ext1_wakeup(buildWakeupBitmask(), ESP_EXT1_WAKEUP_ANY_HIGH);
+  
+  // Configure the timer to wake up the ESP32 every 30 seconds
+  esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
+
   // Starts deep sleep again, after all code has been executed
   esp_deep_sleep_start();
 }
