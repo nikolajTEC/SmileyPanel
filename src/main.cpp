@@ -1,40 +1,55 @@
 #include <Arduino.h>
 #include "driver/rtc_io.h"
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <time.h>
+#include "secrets.h"   // WiFi + MQTT credentials
+#include "ca_cert.h"   // MQTT_CA_CERT (broker's CA certificate)
 
-// Macro to convert a GPIO number into a 64-bit bitmask (1 shifted left by the GPIO number).
-// Used by the ESP32 ext1 wakeup API, which expects a bitmask of wake-capable pins.
+// ── MQTT topic ────────────────────────────────────────────────────────────────
+// Built at compile time: "/devices/device01/Gruppe2ESP"
+// Change the suffix here if the group name ever changes.
+#define MQTT_TOPIC       "/devices/" DEVICE_NAME "/Gruppe2ESP"
+#define MQTT_CLIENT_ID   DEVICE_NAME "_esp32"
+
+// ── NTP / timezone ────────────────────────────────────────────────────────────
+#define TIMEZONE         "CET-1CEST,M3.5.0,M10.5.0/3"   // Europe/Copenhagen
+#define NTP_SERVER       "pool.ntp.org"
+#define NTP_SYNC_TIMEOUT_MS 8000
+
+// ── Sleep config ──────────────────────────────────────────────────────────────
+#define uS_TO_S_FACTOR   1000000ULL
+#define TIME_TO_SLEEP    30
+
+// ── Button pin table ──────────────────────────────────────────────────────────
 #define BUTTON_PIN_BITMASK(GPIO) (1ULL << GPIO)
 
-// Conversion factor for microsecons to seconds
-#define uS_TO_S_FACTOR 1000000ULL  
-// Time ESP32 will go to sleep (in seconds)
-#define TIME_TO_SLEEP  30        
-
-// Struct pairing each physical button with:
-//   wakePin   – the RTC GPIO that wakes the ESP32 from deep sleep
-//   outputPin – the GPIO to pulse HIGH when this button triggers a wakeup
-//   label     – human-readable name logged over Serial
 struct ButtonPinMap {
   gpio_num_t  wakePin;
   uint8_t     outputPin;
   const char* label;
 };
 
-// Central pin table – add, remove, or rename buttons here only.
-// Order doesn't matter; all entries are checked at wakeup.
 static const ButtonPinMap BUTTONS[] = {
   { GPIO_NUM_35, 19, "Meget glad" },
   { GPIO_NUM_34, 21, "Glad"       },
   { GPIO_NUM_39, 22, "Sur"        },
   { GPIO_NUM_36, 23, "Meget sur"  },
 };
-
-// Number of entries in BUTTONS, computed at compile time.
-// Avoids having to manually keep a count in sync with the table.
 static const int BUTTON_COUNT = sizeof(BUTTONS) / sizeof(BUTTONS[0]);
 
-// Builds the bitmask of all wake-capable pins by OR-ing each entry's bitmask together.
-// Called once in setup() to pass to esp_sleep_enable_ext1_wakeup().
+// ── RTC-persisted state ───────────────────────────────────────────────────────
+RTC_DATA_ATTR int bootCount = 0;
+
+// ── Network clients ───────────────────────────────────────────────────────────
+WiFiClientSecure secureClient;
+PubSubClient     mqttClient(secureClient);
+
+// =============================================================================
+//  Helpers
+// =============================================================================
+
 uint64_t buildWakeupBitmask() {
   uint64_t mask = 0;
   for (int i = 0; i < BUTTON_COUNT; i++) {
@@ -43,62 +58,136 @@ uint64_t buildWakeupBitmask() {
   return mask;
 }
 
-// Persists across deep sleep cycles in RTC memory (normal RAM is wiped during deep sleep).
-RTC_DATA_ATTR int bootCount = 0;
+bool connectWiFi() {
+  Serial.printf("Connecting to WiFi: %s", WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-// Determines which button triggered the wakeup, pulses the corresponding output pin,
-// and logs the result. If no known button is matched (e.g. first boot), logs a fallback message.
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    if (millis() - start > 10000) {
+      Serial.println("\nWiFi timeout!");
+      return false;
+    }
+    delay(250);
+    Serial.print(".");
+  }
+  Serial.printf("\nWiFi connected. IP: %s\n", WiFi.localIP().toString().c_str());
+  return true;
+}
+
+bool syncNTP() {
+  configTzTime(TIMEZONE, NTP_SERVER);
+  Serial.print("Syncing NTP");
+
+  struct tm ti{};
+  unsigned long start = millis();
+  while (!getLocalTime(&ti) || ti.tm_year < (2020 - 1900)) {
+    if (millis() - start > NTP_SYNC_TIMEOUT_MS) {
+      Serial.println("\nNTP sync timeout!");
+      return false;
+    }
+    delay(200);
+    Serial.print(".");
+  }
+
+  char buf[32];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &ti);
+  Serial.printf("\nNTP synced: %s (Copenhagen)\n", buf);
+  return true;
+}
+
+// Returns e.g. "2025-05-20 14:32:07"
+String getCPHTimestamp() {
+  struct tm ti{};
+  if (!getLocalTime(&ti)) return "1970-01-01 00:00:00";
+  char buf[24];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &ti);
+  return String(buf);
+}
+
+bool connectMQTT() {
+  // Use the CA cert from ca_cert.h to verify the broker's TLS certificate
+  secureClient.setCACert(MQTT_CA_CERT);
+
+  mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+  mqttClient.setBufferSize(512);
+
+  Serial.printf("Connecting to MQTT %s:%d as %s ...\n", MQTT_HOST, MQTT_PORT, MQTT_USER);
+
+  // MQTT_PASS comes from secrets.h
+  if (mqttClient.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS)) {
+    Serial.println("MQTT connected.");
+    return true;
+  }
+
+  Serial.printf("MQTT connect failed. State: %d\n", mqttClient.state());
+  return false;
+}
+
 void handleWakeupButton() {
-  // Bitmask of whichever GPIO(s) triggered the ext1 wakeup
   uint64_t wakeup_pin_mask = esp_sleep_get_ext1_wakeup_status();
 
   for (int i = 0; i < BUTTON_COUNT; i++) {
-    if (wakeup_pin_mask & BUTTON_PIN_BITMASK(BUTTONS[i].wakePin)) {
-      // Pulse the paired output pin HIGH for 1 second as a confirmation signal
-      pinMode(BUTTONS[i].outputPin, OUTPUT);
-      digitalWrite(BUTTONS[i].outputPin, HIGH);
-      delay(1000);
-      digitalWrite(BUTTONS[i].outputPin, LOW);
+    if (!(wakeup_pin_mask & BUTTON_PIN_BITMASK(BUTTONS[i].wakePin))) continue;
 
-      Serial.printf("Bedømmelse: %s registreret\n", BUTTONS[i].label);
-      return; // Only one button can wake the device; stop checking once found
+    // ── 1. Pulse confirmation output ─────────────────────────────────────
+    pinMode(BUTTONS[i].outputPin, OUTPUT);
+    digitalWrite(BUTTONS[i].outputPin, HIGH);
+    delay(1000);
+    digitalWrite(BUTTONS[i].outputPin, LOW);
+
+    Serial.printf("Bedømmelse: %s registreret\n", BUTTONS[i].label);
+
+    // ── 2. Connect and publish ────────────────────────────────────────────
+    if (!connectWiFi())  break;
+    if (!syncNTP())      break;
+    if (!connectMQTT())  break;
+
+    // Payload: {"label":"Glad","timestamp":"2025-05-20 14:32:07"}
+    char payload[128];
+    snprintf(payload, sizeof(payload),
+             "{\"label\":\"%s\",\"timestamp\":\"%s\"}",
+             BUTTONS[i].label, getCPHTimestamp().c_str());
+
+    if (mqttClient.publish(MQTT_TOPIC, payload, /*retained=*/false)) {
+      Serial.printf("Published → %s : %s\n", MQTT_TOPIC, payload);
+    } else {
+      Serial.println("MQTT publish failed.");
     }
+
+    mqttClient.disconnect();
+    WiFi.disconnect(true);
+    delay(100); // Let the stack flush before deep sleep
+    break;      // Only one button wakes the device at a time
   }
 
-  // Reached if wakeup_pin_mask is 0 (first boot) or an unexpected pin fired
-  Serial.println("Wakeup button unknown (first boot or non-button wakeup)");
+  if (!wakeup_pin_mask) {
+    Serial.println("Wakeup button unknown (first boot or non-button wakeup)");
+  }
 }
+
+// =============================================================================
+//  Arduino entry points
+// =============================================================================
 
 void setup() {
   Serial.begin(115200);
-  delay(100); // Brief delay to ensure Serial is fully ready after waking up
-  
-  // Increment boot number for tracking
+  delay(100);
+
   bootCount++;
 
-  // Read the wakeup reason to decide whether a button or the timer woke us up
   esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
 
   if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT1) {
-    // Handles push of button
-    handleWakeupButton();
-  } 
-  else if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) {
-    // Write to console im alive if woke up by the 30s timer
-    Serial.println("im alive");
-  } 
-  else {
-    // Fallback for initial power-on or reset
-    Serial.printf("Initial boot count: %d\n", bootCount);
+    handleWakeupButton();        // Button press → network + publish
+  } else if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) {
+    Serial.println("im alive"); // Heartbeat, no network needed
+  } else {
+    Serial.printf("Initial boot. Count: %d\n", bootCount);
   }
 
-  // Makes it so the buttons can wake it from deep sleep
   esp_sleep_enable_ext1_wakeup(buildWakeupBitmask(), ESP_EXT1_WAKEUP_ANY_HIGH);
-  
-  // Configure the timer to wake up the ESP32 every 30 seconds
   esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
-
-  // Starts deep sleep again, after all code has been executed
   esp_deep_sleep_start();
 }
 
